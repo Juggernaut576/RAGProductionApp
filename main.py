@@ -2,63 +2,59 @@ import logging
 from fastapi import FastAPI
 import inngest
 import inngest.fast_api
-from google.protobuf.proto import serialize
 from inngest.experimental import ai
 from dotenv import load_dotenv
 import uuid
 import os
 import datetime
-from data_loader import load_and_chunk_pdfz, embed_texts
+from data_loader import load_and_chunk_pdf, embed_texts
 from vector_db import QdrantStorage
-from custom_types import RAGChunkAndSrc, RAGUpsertResult, RAGSearchResult, RAQQueryResult
+from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
 
 load_dotenv()
 
 inngest_client = inngest.Inngest(
-    app_id="rag-app",
+    app_id="rag_app",
     logger=logging.getLogger("uvicorn"),
     is_production=False,
     serializer=inngest.PydanticSerializer()
 )
 
-
 @inngest_client.create_function(
     fn_id="RAG: Ingest PDF",
     trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
     throttle=inngest.Throttle(
-        limit=2,
-        period=datetime.timedelta(minutes=1)
+        count=2, period=datetime.timedelta(minutes=1)
     ),
     rate_limit=inngest.RateLimit(
         limit=1,
         period=datetime.timedelta(hours=4),
         key="event.data.source_id",
-    )
+  ),
 )
 async def rag_ingest_pdf(ctx: inngest.Context):
     def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
-        pdf_path = ctx.event_data["pdf_path"]
+        pdf_path = ctx.event.data["pdf_path"]
         source_id = ctx.event.data.get("source_id", pdf_path)
-        chunks = load_and_chunk_pdfz(pdf_path)
-        return RAGChunkAndSrc(chunk=chunks, source_id=source_id)
+        chunks = load_and_chunk_pdf(pdf_path)
+        return RAGChunkAndSrc(chunks=chunks, source_id=source_id)
 
     def _upsert(chunks_and_src: RAGChunkAndSrc) -> RAGUpsertResult:
-        chunks = chunks_and_src.chunk
+        chunks = chunks_and_src.chunks
         source_id = chunks_and_src.source_id
         vecs = embed_texts(chunks)
         ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(chunks))]
         payloads = [{"source": source_id, "text": chunks[i]} for i in range(len(chunks))]
-        db = QdrantStorage().upsert(ids, vecs, payloads)
+        QdrantStorage().upsert(ids, vecs, payloads)
         return RAGUpsertResult(ingested=len(chunks))
 
-    chunks_and_src = await ctx.step.run(
-        "load-and-chunk", lambda: _load(ctx), output_type=RAGChunkAndSrc)
+    chunks_and_src = await ctx.step.run("load-and-chunk", lambda: _load(ctx), output_type=RAGChunkAndSrc)
     ingested = await ctx.step.run("embed-and-upsert", lambda: _upsert(chunks_and_src), output_type=RAGUpsertResult)
     return ingested.model_dump()
 
 
 @inngest_client.create_function(
-    fn_id="RAG: Query",
+    fn_id="RAG: Query PDF",
     trigger=inngest.TriggerEvent(event="rag/query_pdf_ai")
 )
 async def rag_query_pdf_ai(ctx: inngest.Context):
@@ -72,15 +68,17 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     top_k = int(ctx.event.data.get("top_k", 5))
 
     found = await ctx.step.run("embed-and-search", lambda: _search(question, top_k), output_type=RAGSearchResult)
+
     context_block = "\n\n".join(f"- {c}" for c in found.contexts)
-    user_content = (f"Use the following contexts to answer the question.\n\n"
-                    f"Context:\n{context_block}\n\n"
-                    f"Question: {question}\nAnswer:"
-                    "Answer concisely using the context above."
-                    )
+    user_content = (
+        "Use the following context to answer the question.\n\n"
+        f"Context:\n{context_block}\n\n"
+        f"Question: {question}\n"
+        "Answer concisely using the context above."
+    )
 
     adapter = ai.openai.Adapter(
-        auth_key=os.getenv("OPENAI_PUBLIC_KEY"),
+        auth_key=os.getenv("OPENAI_API_KEY"),
         model="gpt-4o-mini"
     )
 
@@ -90,7 +88,7 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
         body={
             "max_tokens": 1024,
             "temperature": 0.2,
-            "message": [
+            "messages": [
                 {"role": "system", "content": "You answer questions using only the provided context."},
                 {"role": "user", "content": user_content}
             ]
@@ -99,7 +97,6 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
 
     answer = res["choices"][0]["message"]["content"].strip()
     return {"answer": answer, "sources": found.sources, "num_contexts": len(found.contexts)}
-
 
 app = FastAPI()
 
